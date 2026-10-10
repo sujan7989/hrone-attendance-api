@@ -4,6 +4,7 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (loaded from .env for convenience)
 """
+import json
 import os
 import calendar
 from collections import defaultdict
@@ -11,9 +12,11 @@ from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path
-from pydantic import BaseModel, field_validator, model_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -216,12 +219,12 @@ def validate_epoch_ms(v):
 
 
 class EmployeeCreate(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(..., min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field("18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     joined_on: str
 
     @model_validator(mode="after")
@@ -263,8 +266,8 @@ class RegularizeRequest(BaseModel):
     status: Optional[str] = None
     punch_in: Optional[int] = None
     punch_out: Optional[int] = None
-    reason: str
-    regularized_by: str
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
 
     @field_validator("punch_in", "punch_out", mode="before")
     @classmethod
@@ -1022,6 +1025,11 @@ def department_trend(
     return {"department": department, "from": from_date, "to": to_date, "items": all_days}
 
 
+def safe_explain(explain_doc) -> dict:
+    """Convert explain output (may contain BSON types) to a plain JSON-safe dict."""
+    return json.loads(json_util.dumps(explain_doc))
+
+
 @app.get("/admin/explain/{endpoint}")
 def admin_explain(
     endpoint: str = Path(
@@ -1059,14 +1067,20 @@ def admin_explain(
         if status:
             q["status"] = status
         skip = (page - 1) * page_size
-        explain = (
-            db.attendance_logs.find(q)
-            .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
-            .skip(skip)
-            .limit(page_size)
-            .explain()
+        # Use explain command for executionStats verbosity
+        skip = (page - 1) * page_size
+        explain = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+                "sort": {"date": -1, "emp_code": 1},
+                "skip": skip,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": safe_explain(explain)}
 
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
@@ -1084,12 +1098,12 @@ def admin_explain(
             {"$group": {"_id": None, "total": {"$sum": 1}}},
         ]
         explain_doc = db.command(
-            "aggregate", "attendance_logs", pipeline=pipeline, explain=True
+            "aggregate", "attendance_logs", pipeline=pipeline, explain=True, cursor={}
         )
         return {
             "endpoint": endpoint,
             "collection": "attendance_logs",
-            "explain": explain_doc,
+            "explain": safe_explain(explain_doc),
         }
 
     elif endpoint == "department_summary":
@@ -1114,12 +1128,12 @@ def admin_explain(
             {"$sort": {"_id": 1}},
         ]
         explain_doc = db.command(
-            "aggregate", "employees", pipeline=pipeline, explain=True
+            "aggregate", "employees", pipeline=pipeline, explain=True, cursor={}
         )
         return {
             "endpoint": endpoint,
             "collection": "employees",
-            "explain": explain_doc,
+            "explain": safe_explain(explain_doc),
         }
 
     elif endpoint == "late_leaderboard":
@@ -1157,12 +1171,12 @@ def admin_explain(
             pipeline.append({"$unwind": "$emp"})
             pipeline.append({"$match": {"emp.department": department}})
         explain_doc = db.command(
-            "aggregate", "attendance_logs", pipeline=pipeline, explain=True
+            "aggregate", "attendance_logs", pipeline=pipeline, explain=True, cursor={}
         )
         return {
             "endpoint": endpoint,
             "collection": "attendance_logs",
-            "explain": explain_doc,
+            "explain": safe_explain(explain_doc),
         }
 
     elif endpoint == "department_trend":
@@ -1178,11 +1192,18 @@ def admin_explain(
             "emp_code": {"$in": emp_codes},
             "date": {"$gte": from_date, "$lte": to_date},
         }
-        explain = db.attendance_logs.find(q).explain()
+        explain = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": q,
+            },
+            verbosity="executionStats",
+        )
         return {
             "endpoint": endpoint,
             "collection": "attendance_logs",
-            "explain": explain,
+            "explain": safe_explain(explain),
         }
 
     raise HTTPException(422, detail="Unknown endpoint")
